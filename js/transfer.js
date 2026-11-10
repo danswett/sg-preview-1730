@@ -1,0 +1,136 @@
+// Bringing a session that ended on one machine to another: docs/protocol/v1-transfer.md.
+// This device signs a command for the machine the session is on, naming it, the session and the
+// machine that receives it, and sends session.launch with it to that machine, which carries it.
+// Mirrors src/AgentBridge.Host/SignedCommands.cs: the device key is an ECDH key WebCrypto will not
+// let sign, so the signature is a MAC under a key from ECDH between this device and the machine
+// it is for, which only those two can make.
+//
+//   key = HKDF-SHA256(ikm: ECDH(this device, machine), salt: "agent-bridge command v1",
+//                     info: "<this device id>|<machine device id>", 32 bytes)
+//   mac = HMAC-SHA256(key, the body's exact UTF-8 bytes)
+import { utf8 } from './bytes.js';
+import { toBase64url } from './blobs.js';
+import { deviceIdOf } from './identity.js';
+import { trustAction } from './launch.js';
+import { nowArgs } from './update.js';
+
+export const TRANSFER = Object.freeze({
+  capability: 'sessions.transfer',
+  serve: 'sessions.transfer.serve',
+  action: 'session.transfer',
+});
+
+// How long a command may be carried out for: the host takes at most ten minutes.
+export const COMMAND_LIFETIME_S = 5 * 60;
+// A press that manages a machine lives at most two minutes from signing (ManageProtocol.MaxLifetime),
+// Update now's included (#1159): one older is refused expired.
+export const PRESS_LIFETIME_S = 2 * 60;
+
+const subtle = () => globalThis.crypto.subtle;
+
+// The MAC key shared by this device (key, a P256KeyPair) and a machine (its public key).
+export async function commandKey(key, machinePublic, signerId, machineId) {
+  const z = await key.dh(machinePublic);
+  const ikm = await subtle().importKey('raw', z, 'HKDF', false, ['deriveBits']);
+  const bits = await subtle().deriveBits({ name: 'HKDF', hash: 'SHA-256', salt: utf8.encode('agent-bridge command v1'), info: utf8.encode(`${signerId}|${machineId}`) }, ikm, 256);
+  return new Uint8Array(bits);
+}
+
+export async function macOf(keyBytes, bodyBytes) {
+  const k = await subtle().importKey('raw', keyBytes, { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']);
+  return new Uint8Array(await subtle().sign('HMAC', k, bodyBytes));
+}
+
+// A signed command for the machine with machinePublic: { body, by, mac }, each base64url. to is
+// the machine that acts on it; omitted, the machine it is signed for. question and shown: an
+// escaped approval's confirmation names the question and what was read (#803), in the order the
+// host's CommandTarget writes them, and nothing else does. args: a management command's arguments
+// (#801), signed after expiresAt as the host's CommandBody writes them; absent for everything else.
+// lifetimeS: how long it may be carried out for, from now.
+export async function signCommand({ key, deviceId, machinePublic, action, session, to, question, shown, args, now = Date.now(), request = globalThis.crypto.randomUUID(), lifetimeS = COMMAND_LIFETIME_S }) {
+  const machine = await deviceIdOf(machinePublic);
+  const issuedAt = Math.floor(now / 1000);
+  const target = { machine, session };
+  if (question !== undefined) { target.question = question; }
+  if (shown !== undefined) { target.shown = shown; }
+  const fields = {
+    v: 1,
+    action,
+    request,
+    principal: { kind: 'user', device: deviceId },
+    target,
+    to: to ?? machine,
+    issuedAt,
+    expiresAt: issuedAt + lifetimeS,
+  };
+  if (args !== undefined) { fields.args = args; }
+  const body = utf8.encode(JSON.stringify(fields));
+  const mac = await macOf(await commandKey(key, machinePublic, deviceId, machine), body);
+  return { body: toBase64url(body), by: toBase64url(key.public), mac: toBase64url(mac) };
+}
+
+// A signed session.transfer command.
+export function signTransfer({ session, to, ...rest }) {
+  return signCommand({ ...rest, action: TRANSFER.action, session, to });
+}
+
+// A signed launch.trust.answer command, for one choice on one question, for the machine asking
+// it (docs/protocol/v1-launch.md, "Folder trust").
+export function signTrust({ question, choice, ...rest }) {
+  return signCommand({ ...rest, action: trustAction(choice), session: question });
+}
+
+// The confirmation of an approval with escaped characters (#803, docs/protocol/v1-sessions.md,
+// "Escaped approvals"): signed when its button is pressed, for this session, this question and the
+// digest of the message as this device has it, with the answer's own request.
+export const ESCAPED_ACTION = 'session.approve:escaped';
+export function signEscapedApproval({ session, question, shown, request, ...rest }) {
+  return signCommand({ ...rest, action: ESCAPED_ACTION, session, question, shown, request });
+}
+
+// An Update now press (#1159, docs/protocol/v1-update.md "The press"): for this machine alone, no
+// session, its request only inside, and args binding now, the release shown and what the
+// confirmation showed (accept, absent for one press on a quiet machine). Lives PRESS_LIFETIME_S.
+export const UPDATE_NOW_ACTION = 'update.install.now';
+export function signUpdateNow({ release, accept = null, request, ...rest }) {
+  return signCommand({ ...rest, action: UPDATE_NOW_ACTION, request, args: nowArgs({ release, accept }), lifetimeS: PRESS_LIFETIME_S });
+}
+
+// The sessions the account's other machines offer for a transfer to target, each with its
+// machine's static key, which the command is signed for: [{ hostId, machineName, key,
+// resumable }]. One machine at a time, each over a short channel, as fleet.js looks at them; a
+// machine that does not answer, or does not hand its sessions on, contributes nothing.
+// Lookups under way, from the first channel's opening to the last one closed: the connection
+// doesn't rest under one (main.js busy), or Launch would show a list cut short that nothing asks
+// again for.
+let collecting = 0;
+export const collectingRemote = () => collecting > 0;
+
+export async function collectRemote(args) {
+  collecting += 1;
+  try { return await collectEach(args); } finally { collecting -= 1; }
+}
+
+async function collectEach({ connection, targetId, me, makeClient, timeoutMs = 10000 }) {
+  const out = [];
+  for (const d of connection.presence ?? []) {
+    if (d.kind !== 'host' || d.id === me || d.id === targetId) { continue; }
+    let channel = null;
+    let client = null;
+    try {
+      channel = await connection.openChannel(d.id, { timeoutMs });
+      client = makeClient(channel);
+      const hello = await client.hello();
+      if (!hello.capabilities.includes(TRANSFER.serve)) { continue; }
+      const options = await client.launchOptions();
+      const key = channel.hs?.remoteStatic;
+      if (!key || options.resumable.length === 0) { continue; }
+      out.push({ hostId: d.id, machineName: hello.machine?.name || d.name || 'another machine', key: new Uint8Array(key), resumable: options.resumable });
+    } catch {
+      // Asleep, offline or older: nothing from it this time.
+    } finally {
+      if (client) { client.close(); } else { channel?.close(); }
+    }
+  }
+  return out;
+}

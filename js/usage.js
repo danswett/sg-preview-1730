@@ -1,0 +1,448 @@
+// Agent usage (docs/protocol/v1-usage.md): reading reports, merging every machine's into one
+// row per allowance, and the words and colours a client shows. Mirrors
+// src/AgentBridge.Protocol/Usage.cs, and agent-ha-bridge's AgentBridgeUsageCard exactly in
+// what it shows. Pure: nothing here touches the DOM, so it is tested in Node.
+
+export const USAGE = Object.freeze({ capability: 'usage', shared: 'usage.shared', get: 'usage.get', subscribe: 'usage.subscribe', update: 'usage.update' });
+
+// How long a reading is kept, by a host for the account's other machines and by this app for the
+// account (#172): a fortnight-old figure is history, not usage.
+export const KEPT_MS = 14 * 86400000;
+export const KEPT_MAX = 32;
+// How far ahead of the device's clock a reading may be stamped, as a host allows peer readings.
+export const MAX_AHEAD_MS = 10 * 60000;
+
+const AGENTS = ['copilot', 'claude', 'codex'];
+const SOURCES = ['api', 'cache', 'transcript', 'none'];
+const str = (v) => (typeof v === 'string' && v !== '' ? v : null);
+const num = (v) => (typeof v === 'number' && Number.isFinite(v) ? v : null);
+const obj = (v) => (v !== null && typeof v === 'object' && !Array.isArray(v) ? v : null);
+
+function readWindow(raw) {
+  const w = obj(raw);
+  const percent = num(w?.percent);
+  if (!w || percent === null) { return null; }
+  return {
+    key: str(w.key) ?? '',
+    label: str(w.label) ?? str(w.key) ?? '',
+    percent,
+    used: num(w.used),
+    limit: num(w.limit),
+    unit: str(w.unit),
+    startsAt: str(w.startsAt),
+    resetsAt: str(w.resetsAt),
+  };
+}
+
+function readAgent(raw) {
+  const a = obj(raw);
+  if (!a) { return null; }
+  const agent = AGENTS.includes(a.agent) ? a.agent : 'unknown';
+  return {
+    agent,
+    label: str(a.label) ?? agent,
+    account: str(a.account),
+    accountKey: str(a.accountKey),
+    plan: str(a.plan),
+    source: SOURCES.includes(a.source) ? a.source : 'none',
+    windows: Array.isArray(a.windows) ? a.windows.map(readWindow).filter(Boolean) : [],
+    error: str(a.error),
+    measuredAt: str(a.measuredAt),
+    // A further account the host was asked to report (usage.copilotAccounts), by its place. Rows
+    // are grouped by account, not by this: one machine's further account is another's own.
+    slot: Number.isInteger(a.slot) ? a.slot : null,
+    // The machine that took it, on a reading a host passed on from another of the account's
+    // machines (usage.shared). Clients mark their own with the machine that sent it.
+    readBy: readReader(a.readBy),
+  };
+}
+
+function readReader(raw) {
+  const r = obj(raw);
+  const id = str(r?.id);
+  if (!id || id.length > 64) { return null; }
+  return { id, name: (str(r.name) ?? id.slice(0, 8)).slice(0, 64) };
+}
+
+// usage.get's and usage.subscribe's result, and usage.update's data.
+export function readUsage(raw) {
+  const r = obj(raw);
+  return { agents: Array.isArray(r?.agents) ? r.agents.map(readAgent).filter(Boolean) : [] };
+}
+
+export const hasReading = (entry) => entry.windows.length > 0;
+
+// The fullest window: what the folded line shows and what the rows are ordered by. A weekly
+// allowance at 90% matters more than a session window at 2%.
+//
+// A window whose reset has come since its reading was taken says nothing about now: its percent is
+// the last period's, so it is shown as "Reset", never as a figure or a zero (#499). The headline
+// leaves lapsed windows out, and is null when every window has lapsed.
+export const lapsed = (w, now = Date.now()) => { const at = Date.parse(w.resetsAt ?? ''); return Number.isFinite(at) && at <= now; };
+export function headline(entry, now = Date.now()) {
+  const open = entry.windows.filter((w) => !lapsed(w, now));
+  return open.length ? Math.max(...open.map((w) => w.percent)) : null;
+}
+
+// One row per allowance, carrying the freshest reading any machine has. An allowance belongs
+// to an account, not a computer, so two machines signed in to one report it twice: a laptop
+// shut for a week is outvoted, not averaged in. A reading outranks a failure however new,
+// because a failure is stamped with when the attempt was made: on the clock alone, a machine
+// that cannot read an account would hide the figure another machine has.
+export function mergeUsage(reports) {
+  const entries = combineUsage(reports);
+  // Two rows of one agent with no account to name either (Claude names none) would look the
+  // same: a few characters of the key keep them apart, only when there is something to keep
+  // apart.
+  const perAgent = new Map();
+  for (const e of entries) { perAgent.set(e.agent, (perAgent.get(e.agent) ?? 0) + 1); }
+  for (const e of entries) {
+    if (!e.account && e.accountKey && perAgent.get(e.agent) > 1) { e.account = `#${e.accountKey.slice(0, 4)}`; }
+  }
+  return entries.sort((x, y) => (headline(y) ?? 0) - (headline(x) ?? 0));
+}
+
+// One entry per allowance, as mergeUsage, without the names it adds for showing them: what this
+// app keeps of an account's usage between visits. Of two readings taken at the same moment, the
+// one from the report given first.
+export function combineUsage(reports) {
+  const entries = [];
+  for (const { reading, failure } of usageSlots(reports)) {
+    if (!reading) { entries.push(failure); continue; }
+    // The reading is drawn; a failure newer than it is still the latest word on why nothing
+    // fresher exists, shown only once the reading is stale.
+    entries.push(failure?.error && failure.at > reading.at ? { ...reading, error: failure.error } : reading);
+  }
+  return entries;
+}
+
+// Each allowance's latest reading, and its latest failure where that is newer, as separate entries
+// with their own times: what is kept (#172). Combined into one, a failure's error would take the
+// reading's time, and go with it at 14 days while the failure itself still stands.
+export function latestUsage(reports) {
+  const entries = [];
+  for (const { reading, failure } of usageSlots(reports)) {
+    if (reading) { entries.push(reading); }
+    if (failure && (!reading || failure.at > reading.at)) { entries.push(failure); }
+  }
+  return entries;
+}
+
+// Which allowance a reading is of: its agent and account. One that names no account at all (Codex's
+// from its transcripts, or from a probe that could not be sure whose it was) could be anyone's, so
+// it stays a row of its own for the machine that read it: grouped by agent alone, the newest would
+// stand in for every other user's (#200). Mirrors UsageShare.Key. readBy is always there by now:
+// UsageBook stamps each host's own readings with that host, and a reading passed on already names
+// the machine that took it, so keyless readings of two machines never share a key. UsageBook drops
+// any kept reading that names no machine; called directly with one, it is still kept apart from
+// other readings, by what it read and when, the same key every time.
+export function usageKey(a) {
+  if (!a.accountKey && !a.account) { return `${a.agent}\u0000\u0000${a.readBy?.id ?? `\u0001${a.source ?? ''}\u0001${a.measuredAt ?? ''}`}`; }
+  return `${a.agent}\u0000${a.accountKey ?? (a.account ?? '').toLowerCase()}`;
+}
+
+function usageSlots(reports) {
+  const slots = new Map();
+  for (const a of current((reports ?? []).flatMap((report) => report?.agents ?? []))) {
+    const key = usageKey(a);
+    const entry = { ...a, key, at: Date.parse(a.measuredAt ?? '') || 0 };
+    const kind = hasReading(entry) ? 'reading' : 'failure';
+    const slot = slots.get(key) ?? {};
+    if (!slot[kind] || slot[kind].at < entry.at) { slot[kind] = entry; }
+    slots.set(key, slot);
+  }
+  return slots.values();
+}
+
+// One machine's readings of an agent that name an account and that name none are never shown side
+// by side: whichever kind it took last stands for it (#200). Codex alternates between them, a
+// probe's keyed reading while idle and its transcripts' keyless ones while a session runs, and kept
+// apart they were one allowance shown twice. A failure is held to the same rule: a sign-out older
+// than the other kind's last reading is history, and one newer than it still stands. Readings of
+// the two kinds measured at the same moment go to whichever was reported first. Of two failures of
+// the two kinds, with no reading newer than either, the later stands. Mirrors UsageMerge.Current.
+function current(agents) {
+  const of = (a) => `${a.agent}\u0000${a.readBy?.id ?? ''}`;
+  const at = (a) => Date.parse(a.measuredAt ?? '') || 0;
+  const keyless = (a) => !a.accountKey && !a.account;
+  const kind = (a, bare) => `${of(a)}\u0000${bare}`;
+  const newest = new Map();
+  const failed = new Map();
+  agents.forEach((a, order) => {
+    if (!a.readBy?.id) { return; }
+    const latest = a.windows?.length ? newest : failed;
+    const n = latest.get(kind(a, keyless(a)));
+    if (!n || at(a) > n.at) { latest.set(kind(a, keyless(a)), { at: at(a), order }); }
+  });
+  return agents.filter((a, i) => {
+    // Of no known machine (only a direct caller's; UsageBook places every reading): nothing to
+    // stand in for, or be stood in for by.
+    if (!a.readBy?.id) { return true; }
+    const other = newest.get(kind(a, !keyless(a)));
+    if (!a.windows?.length) {
+      if (other && at(a) <= other.at) { return false; }
+      const f = failed.get(kind(a, !keyless(a)));
+      return !f || at(a) > f.at || (at(a) === f.at && i < f.order);
+    }
+    if (!other) { return true; }
+    return at(a) > other.at || (at(a) === other.at && i < other.order);
+  });
+}
+
+export function severity(percent) {
+  if (!Number.isFinite(percent)) { return ''; }
+  if (percent >= 90) { return 'crit'; }
+  if (percent >= 75) { return 'warn'; }
+  return '';
+}
+
+// An hour old is not a reading, it is a memory; routine for Codex, whose only source is its
+// own last transcript.
+export const isStale = (at, now = Date.now()) => at > 0 && now - at > 3600000;
+
+// "in 25d" / "in 4h" / "in 12m". Past is "due": the window has rolled over, and the figure
+// beside it is the old one until the agent runs again.
+export function until(iso, now = Date.now()) {
+  const at = Date.parse(iso ?? '');
+  if (!Number.isFinite(at)) { return ''; }
+  const seconds = Math.round((at - now) / 1000);
+  if (seconds <= 0) { return 'due'; }
+  if (seconds >= 86400) { return `in ${Math.round(seconds / 86400)}d`; }
+  if (seconds >= 3600) { return `in ${Math.round(seconds / 3600)}h`; }
+  return `in ${Math.max(1, Math.round(seconds / 60))}m`;
+}
+
+// "Reset 12m ago · no reading since", for a lapsed window's foot.
+export const resetAgo = (iso, now = Date.now()) => `Reset ${ago(Date.parse(iso), now)} \u00b7 no reading since`;
+
+// One sentence for a screen reader: "Claude · max, Session (5h): reset 12 minutes ago, no reading since."
+export function resetSentence(entry, w, now = Date.now()) {
+  const minutes = Math.max(0, Math.round((now - Date.parse(w.resetsAt)) / 60000));
+  const [n, unit] = minutes >= 1440 ? [Math.round(minutes / 1440), 'day'] : minutes >= 60 ? [Math.round(minutes / 60), 'hour'] : [minutes, 'minute'];
+  const who = [entry.label, entry.account].filter(Boolean).join(' \u00b7 ');
+  return `${who}, ${w.label}: reset ${n} ${unit}${n === 1 ? '' : 's'} ago, no reading since.`;
+}
+
+export function ago(at, now = Date.now()) {
+  if (!at) { return ''; }
+  const seconds = Math.round((now - at) / 1000);
+  if (seconds < 90) { return 'just now'; }
+  if (seconds < 3600) { return `${Math.round(seconds / 60)}m ago`; }
+  if (seconds < 86400) { return `${Math.round(seconds / 3600)}h ago`; }
+  return `${Math.round(seconds / 86400)}d ago`;
+}
+
+export const amount = (value) => (Number.isFinite(value) ? Math.round(value).toLocaleString('en-US') : '');
+
+// How far through its window we are, 0-100, worked out now rather than when the host read
+// it; null unless both ends are known.
+export function elapsed(window, now = Date.now()) {
+  const start = Date.parse(window.startsAt ?? '');
+  const end = Date.parse(window.resetsAt ?? '');
+  if (!Number.isFinite(start) || !Number.isFinite(end) || end <= start) { return null; }
+  return Math.round(1000 * Math.min(1, Math.max(0, (now - start) / (end - start)))) / 10;
+}
+
+// The spend against the clock. A tenth of the window either way is noise, not a trend worth
+// colouring.
+export function pace(percent, gone) {
+  const ahead = percent - gone;
+  if (ahead > 10) { return { text: `${Math.round(ahead)}% ahead of pace`, ahead: true }; }
+  if (ahead < -10) { return { text: `${Math.round(-ahead)}% under pace`, ahead: false }; }
+  return { text: 'on pace', ahead: false };
+}
+
+// A failed read beside a reading taken minutes ago is noise; with no reading, or an old one,
+// the failure is all there is to say.
+export const showsError = (entry, now = Date.now()) => !!entry.error && !(hasReading(entry) && entry.at > 0 && !isStale(entry.at, now));
+
+// Which machine took a reading: a kept one, or one a host passed on, may be from a machine that is
+// offline now (#172). The Windows app leaves it out for the machine it runs on; here there is none.
+export const readOn = (entry) => (entry.readBy?.name ? `read on ${entry.readBy.name}` : '');
+
+// "3 sessions · 0.1.0 (dev)", from hello's machine (and a live count when there is one), and
+// "discovery held: …" while the host's discovery is held, as agent-ha-bridge's status line said.
+// The same, as facts for a machine's row (#213): { sessions, version, readOnly, held }, each a
+// short phrase or null; the reasons are the host's own words, for a tooltip, never the row.
+export function machineFacts({ sessions = null, hostVersion = null, dev = false, held = null, readOnly = null } = {}) {
+  return {
+    sessions: Number.isInteger(sessions) && sessions >= 0 ? `${sessions} session${sessions === 1 ? '' : 's'}` : null,
+    version: hostVersion ? `${hostVersion}${dev ? ' (dev)' : ''}` : null,
+    readOnly: typeof readOnly === 'string' && readOnly ? readOnly : null,
+    held: typeof held === 'string' && held ? held : null,
+  };
+}
+
+export function machineStatus({ sessions = null, hostVersion = null, dev = false, held = null, readOnly = null } = {}) {
+  const bits = [];
+  if (Number.isInteger(sessions) && sessions >= 0) { bits.push(`${sessions} session${sessions === 1 ? '' : 's'}`); }
+  if (hostVersion) { bits.push(`${hostVersion}${dev ? ' (dev)' : ''}`); }
+  if (typeof readOnly === 'string' && readOnly) { bits.push(`read-only: ${readOnly}`); }
+  if (typeof held === 'string' && held) { bits.push(`discovery held: ${held}`); }
+  return bits.join(' \u00b7 ');
+}
+
+// Every machine's latest report, kept until replaced, so a machine that goes away is outvoted
+// rather than forgotten mid-read. Listeners hear of every change.
+//
+// With a cache (useCache, once signed in), it also keeps the last reading of each of the account's
+// allowances between visits (#172), so a reading outlives the machine that took it going offline,
+// as agent-ha-bridge's retained sensors did in Home Assistant. Each reading is marked with the
+// machine that took it (readBy): a host's own with that host, one it passed on from another
+// machine already says. Readings older than KEPT_MS go.
+export class UsageBook {
+  #reports = new Map();
+  #listeners = new Set();
+  #kept = [];
+  #cache = null;
+  #saved = '[]';
+  // Machines forgotten (#50) while this page is open: what they read is dropped even where another
+  // host still passes it on, until they come back.
+  #forgotten = new Set();
+  #members = null;
+  #excluded = new Set();
+
+  constructor({ now = () => Date.now() } = {}) { this.now = now; }
+
+  onChange(fn) { this.#listeners.add(fn); return () => this.#listeners.delete(fn); }
+
+  #emit() { for (const fn of this.#listeners) { try { fn(); } catch (e) { console.error(e); } } }
+
+  // name: what the machine is called, for "read on <name>".
+  set(machineId, report, name = null) {
+    if (!machineId) { return; }
+    // A machine reporting is the account's again, whether or not it was forgotten.
+    this.#forgotten.delete(machineId);
+    this.#excluded.delete(machineId);
+    this.#reports.set(machineId, { report: readUsage(report), name: typeof name === 'string' && name ? name : null });
+    this.#keep();
+    this.#emit();
+  }
+
+  // A machine that has said it reports no usage (hello without the capability: usage.publish
+  // off) has nothing to outvote; its last report would otherwise be shown for good. forget: the
+  // machine was forgotten (#50), so what it read is not kept or shown either, wherever it comes from.
+  delete(machineId, { forget = false } = {}) {
+    const had = this.#reports.delete(machineId);
+    if (forget) {
+      this.#forgotten.add(machineId);
+      this.#kept = this.#kept.filter((e) => e.readBy?.id !== machineId);
+    } else if (!had) { return; }
+    this.#keep();
+    this.#emit();
+  }
+
+  get size() { return this.#reports.size; }
+
+  // Whether there is anything to show: a report from a machine, or a reading kept.
+  get empty() { return this.#reports.size === 0 && this.entries().length === 0; }
+
+  #live() {
+    return [...this.#reports].map(([id, { report, name }]) => ({
+      agents: report.agents
+        .map((a) => (a.readBy ? a : { ...a, readBy: { id, name: name ?? id.slice(0, 8) } }))
+        .filter((a) => this.#stands(a)),
+    }));
+  }
+
+  // Whether what a machine read is still the account's: not forgotten while this page is open, and,
+  // where the relay keeps a roster, one of its machines (one forgotten while the page was closed is
+  // in neither presence nor the roster). One a roster has left out stays out once there is none,
+  // until a roster lists it again or it reports itself: a host's report from before still carries
+  // what it passed on, and would otherwise bring it back.
+  #stands(a) {
+    const id = a.readBy?.id;
+    if (!id || this.#forgotten.has(id)) { return !id; }
+    if (!this.#members) { return !this.#excluded.has(id); }
+    if (this.#members.has(id)) { this.#excluded.delete(id); return true; }
+    this.#excluded.add(id);
+    return false;
+  }
+
+  // The account's machines, online or not, as the relay's roster and presence have them; null
+  // where the relay keeps no roster.
+  roster(ids) {
+    const next = Array.isArray(ids) ? new Set(ids) : null;
+    const same = next === null ? this.#members === null : this.#members !== null && next.size === this.#members.size && [...next].every((id) => this.#members.has(id));
+    if (same) { return; }
+    this.#members = next;
+    // Everything held now is checked against it at once, so what it leaves out is remembered even
+    // where nothing is kept or drawn before the roster is gone again.
+    if (next) { this.#current(); }
+    this.#keep();
+    this.#emit();
+  }
+
+  // None past its 14 days goes into a merge: chosen first and dropped after, an expired reading
+  // would take a current failure of the same allowance with it.
+  #fresh(agents) {
+    const oldest = this.now() - KEPT_MS;
+    // One stamped too far ahead is a wrong clock's; it would outrank every genuine reading.
+    const latest = this.now() + MAX_AHEAD_MS;
+    return agents.filter((a) => { const at = Date.parse(a.measuredAt ?? '') || 0; return at >= oldest && at <= latest; });
+  }
+
+  #current() {
+    return [...this.#live().map((r) => ({ agents: this.#fresh(r.agents) })), { agents: this.#fresh(this.#kept).filter((a) => this.#stands(a)) }];
+  }
+
+  // Where readings are kept, none past their 14 days, whether or not anything has been heard since:
+  // the view redraws on a timer, and a machine that went offline sends nothing more.
+  entries() {
+    if (!this.#cache) {
+      const latest = this.now() + MAX_AHEAD_MS;
+      const notAhead = (agents) => agents.filter((a) => (Date.parse(a.measuredAt ?? '') || 0) <= latest);
+      return mergeUsage([...this.#live().map((r) => ({ agents: notAhead(r.agents) })), { agents: notAhead(this.#kept) }]);
+    }
+    return mergeUsage(this.#current());
+  }
+
+  // What is kept for the signed-in account (as the store gave it back), and where to keep it:
+  // save(entries) is called with every change to what is kept.
+  useCache({ entries = [], save = () => {} } = {}) {
+    // A reading and a newer failure of each allowance.
+    const loaded = readUsage({ agents: Array.isArray(entries) ? entries.slice(0, 2 * KEPT_MAX) : [] }).agents;
+    // A machine forgotten while the store was being read takes what it read with it here too, and
+    // the store hears of that: what was saved is what was loaded, not what is kept. One that names no
+    // machine (kept before readings were marked) cannot be placed beside the rest, and goes too, so
+    // every reading merged here names the machine that took it.
+    this.#kept = this.#fresh(loaded).filter((a) => a.readBy?.id && this.#stands(a));
+    this.#saved = JSON.stringify(loaded);
+    this.#cache = { save };
+    this.#keep();
+    this.#emit();
+  }
+
+  #keep() {
+    if (!this.#cache) { return; }
+    // Each allowance's reading and any newer failure, apart, each with its own time; as many
+    // allowances as a host keeps (PeerUsage), the one read longest ago going first.
+    const groups = new Map();
+    for (const e of latestUsage(this.#current())) {
+      const g = groups.get(e.key) ?? { at: 0, entries: [] };
+      g.at = Math.max(g.at, e.at);
+      g.entries.push(e);
+      groups.set(e.key, g);
+    }
+    this.#kept = [...groups.values()].sort((x, y) => y.at - x.at).slice(0, KEPT_MAX)
+      .flatMap((g) => g.entries).map(({ key, at, ...a }) => a);
+    const text = JSON.stringify(this.#kept);
+    // Every report from every machine passes through here; most change nothing kept.
+    if (text === this.#saved) { return; }
+    this.#saved = text;
+    try { this.#cache.save(this.#kept); } catch (e) { console.warn('usage cache:', e?.message); }
+  }
+
+  // Everything tied to the signed-in account goes with it, what is kept included.
+  clear() {
+    const had = this.#reports.size > 0 || this.#kept.length > 0;
+    this.#reports.clear();
+    this.#kept = [];
+    this.#cache = null;
+    this.#saved = '[]';
+    this.#forgotten.clear();
+    this.#members = null;
+    this.#excluded.clear();
+    if (had) { this.#emit(); }
+  }
+}
